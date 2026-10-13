@@ -3,6 +3,9 @@ dist/
 .env
 .env.*
 !.env.example
+.env.bak
+config/*.local.*
+secrets/
 *.log
 coverage/
 .DS_Store

@@ -18,6 +18,7 @@ test('connected database readiness and unconfigured social providers', async () 
     assert.equal((await app.inject('/health/ready')).statusCode, 200);
     const auth = (await app.inject('/v1/auth/providers')).json();
     assert.equal(auth.mode, 'not_configured');
+    assert.equal(auth.protocol_version, 2);
     assert.equal(auth.providers.length, 3);
     assert.ok(auth.providers.every((provider: { enabled: boolean }) => !provider.enabled));
     assert.equal((await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { password: 'test' } })).statusCode, 404);
