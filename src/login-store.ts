@@ -2,7 +2,8 @@ import type { Pool, PoolClient } from 'pg';
 import type { LoginIdentity, ProviderId } from './login-provider.js';
 import { REFRESH_RETRY_SECONDS } from './session-tokens.js';
 
-export type Player = { id: string };
+export type Player = { id: string; cafe_name?: string | null; owner_character_id?: string | null };
+export type SetupResult = { player: Player } | { error: 'session_expired' | 'profile_already_set' | 'cafe_name_taken' };
 export type LoginResult = { status: 'pending' | 'processing' | 'success' | 'failed' | 'claimed'; player_id: string | null; error_code: string | null; accessExpires?: Date; idleExpires?: Date };
 export type MobileGrant = { familyId: string; refreshHash: string; idleExpires: Date };
 export type RotationGrant = { refreshHash: string; accessHash: string; accessExpires: Date; idleExpires: Date };
@@ -18,6 +19,8 @@ export interface LoginStore {
   refresh(tokenHash: string, requestId: string, grant: RotationGrant): Promise<RefreshResult>;
   revokeRefresh(tokenHash: string): Promise<void>;
   me(tokenHash: string): Promise<Player | undefined>;
+  isCafeNameAvailable(name: string, playerId: string): Promise<boolean>;
+  setupCafe(tokenHash: string, owner: string, name: string): Promise<SetupResult>;
   revoke(tokenHash: string): Promise<void>;
 }
 
@@ -157,8 +160,40 @@ export function postgresLoginStore(pool: Pool): LoginStore {
       });
     },
     async me(tokenHash) {
-      return (await pool.query<Player>(`SELECT s.player_id AS id FROM auth_sessions s LEFT JOIN mobile_session_families f ON f.id=s.mobile_family_id
+      return (await pool.query<Player>(`SELECT s.player_id AS id, p.cafe_name, p.owner_character_id FROM auth_sessions s JOIN players p ON p.id=s.player_id LEFT JOIN mobile_session_families f ON f.id=s.mobile_family_id
         WHERE s.token_hash=$1 AND s.expires_at>now() AND (s.mobile_family_id IS NULL OR (f.revoked_at IS NULL AND f.idle_expires_at>now()))`, [tokenHash])).rows[0];
+    },
+    async isCafeNameAvailable(name, playerId) {
+      // The exact generated-key function also enforces uniqueness on every DB write.
+      const result = await pool.query<{ available: boolean }>(`SELECT NOT EXISTS (
+        SELECT 1 FROM players WHERE cafe_name_key=cafe_name_identity($1) AND id<>$2::uuid
+      ) AS available`, [name, playerId]);
+      return result.rows[0]!.available;
+    },
+    async setupCafe(tokenHash, owner, name) {
+      try {
+        return await transaction(async db => {
+          const player = (await db.query<Player>(`SELECT p.id, p.cafe_name, p.owner_character_id
+            FROM players p JOIN auth_sessions s ON s.player_id=p.id
+            LEFT JOIN mobile_session_families f ON f.id=s.mobile_family_id
+            WHERE s.token_hash=$1 AND s.expires_at>now()
+            AND (s.mobile_family_id IS NULL OR (f.revoked_at IS NULL AND f.idle_expires_at>now()))
+            FOR UPDATE OF p`, [tokenHash])).rows[0];
+          if (!player) return { error: 'session_expired' } as const;
+          if (player.owner_character_id != null) {
+            // A lost response/repeated tap is safe; a different choice cannot overwrite it.
+            return player.owner_character_id === owner && player.cafe_name === name
+              ? { player } : { error: 'profile_already_set' } as const;
+          }
+          const saved = (await db.query<Player>(`UPDATE players SET owner_character_id=$2, cafe_name=$3
+            WHERE id=$1 RETURNING id, cafe_name, owner_character_id`, [player.id, owner, name])).rows[0]!;
+          return { player: saved };
+        });
+      } catch (error) {
+        const constraint = error as { code?: string; constraint?: string };
+        if (constraint.code === '23505' && constraint.constraint === 'players_cafe_name_key_unique') return { error: 'cafe_name_taken' };
+        throw error;
+      }
     },
     async revoke(tokenHash) {
       await transaction(async db => {

@@ -45,6 +45,25 @@ try {
   assert.equal((await app.inject({ method: 'POST', url: '/v1/auth/kakao/native', payload: { providerAccessToken: 'invalid' } })).statusCode, 401);
   assert.equal((await app.inject('/v1/auth/me')).statusCode, 401);
   assert.equal((await app.inject({ url: '/v1/auth/me', headers: { authorization: 'Bearer ' + first.accessToken } })).statusCode, 200);
+  const nameHeaders = { authorization: 'Bearer ' + first.accessToken };
+  const checkName = (cafe_name: string) => app.inject({ method: 'POST', url: '/v1/auth/cafe-name/check', headers: nameHeaders, payload: { cafe_name } });
+  assert.equal((await app.inject({ method: 'POST', url: '/v1/auth/cafe-name/check', payload: { cafe_name: '도트한잔' } })).statusCode, 401);
+  assert.deepEqual((await checkName('도트한잔')).json(), { cafe_name: '도트한잔', available: true });
+  const namedFixture = (await pool.query("INSERT INTO players(cafe_name) VALUES('도트한잔') RETURNING id")).rows[0].id;
+  for (const invalidName of ['\u00a0도트한잔\u3000', '도트 한잔', '찻집🍵', '찻집_1', '도트한잔\n']) {
+    assert.deepEqual((await checkName(invalidName)).json(), { error: 'invalid_cafe_name', reason: 'invalid_characters' });
+  }
+  assert.equal((await checkName('도트한잔'.normalize('NFD'))).json().available, false);
+  assert.equal((await checkName('')).statusCode, 400);
+  assert.equal((await checkName('가'.repeat(65))).statusCode, 400);
+  assert.equal((await pool.query('SELECT cafe_name FROM players WHERE id=$1', [first.player.id])).rows[0].cafe_name, null, 'Checking must not save the name');
+  await pool.query("UPDATE players SET cafe_name='DotTea' WHERE id=$1", [namedFixture]);
+  assert.equal((await checkName('dottea')).json().available, false);
+  await pool.query("UPDATE players SET cafe_name='내찻집' WHERE id=$1", [first.player.id]);
+  assert.equal((await checkName('내찻집')).json().available, true, 'Own current name stays available to the same account');
+  assert.equal((await app.inject({ url: '/v1/auth/me', headers: nameHeaders })).json().player.cafe_name, '내찻집');
+  await pool.query('UPDATE players SET cafe_name=NULL WHERE id=$1', [first.player.id]);
+  await pool.query('DELETE FROM players WHERE id=$1', [namedFixture]);
   await app.inject({ method: 'POST', url: '/v1/auth/logout', headers: { authorization: 'Bearer ' + first.accessToken } });
   assert.equal((await app.inject({ url: '/v1/auth/me', headers: { authorization: 'Bearer ' + first.accessToken } })).statusCode, 401);
   assert.equal((await app.inject({ method: 'POST', url: '/v1/auth/session/refresh', payload: { refreshToken: first.refreshToken, request_id: randomUUID() } })).statusCode, 401, 'Bearer logout must revoke its mobile family');
@@ -179,7 +198,7 @@ try {
       child.on('exit', code => code === 0 ? resolve() : reject(new Error('Godot authentication smoke failed')));
     });
   }
-  console.log('Isolated PostgreSQL OAuth/SDK tests passed: auto signup, returning sign-in, provider isolation, concurrency, email fallback, state/proof, replay/expiry/cancel, session/revocation.');
+  console.log('Isolated PostgreSQL OAuth/SDK tests passed: auto signup, returning sign-in, provider isolation, concurrency, email fallback, state/proof, replay/expiry/cancel, session/revocation, authenticated cafe-name checks/normalization and no saving.');
 } finally {
   await app.close();
   await pool.end();

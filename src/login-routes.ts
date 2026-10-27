@@ -3,12 +3,15 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { LoginError, type LoginProvider, type ProviderId } from './login-provider.js';
 import type { LoginStore } from './login-store.js';
 import { ACCESS_SECONDS, REFRESH_IDLE_SECONDS, expiryAfter, rotatedToken } from './session-tokens.js';
+import { validateCafeName } from './cafe-name.js';
 
 export const hashSecret = (value: string) => createHash('sha256').update(value).digest('hex');
 const opaque = () => randomBytes(32).toString('base64url');
 const validProof = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
 const validId = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 const bearer = (request: FastifyRequest) => /^Bearer ([A-Za-z0-9_-]{43})$/.exec(request.headers.authorization ?? '')?.[1];
+const owners = new Set(['human-male', 'human-female', 'cat-ginger', 'cat-black', 'cat-white-gray',
+  'fox-orange', 'fox-white', 'rabbit-white', 'rabbit-light-brown']);
 
 export function registerAuthRoutes(app: FastifyInstance, store: LoginStore, rotationSecret: string) {
   const buckets = new Map<string, { count: number; expires: number }>();
@@ -32,6 +35,32 @@ export function registerAuthRoutes(app: FastifyInstance, store: LoginStore, rota
     try {
       const player = await store.me(hashSecret(token));
       return player ? { player } : reply.code(401).send({ error: 'session_expired' });
+    } catch { return reply.code(503).send({ error: 'server_unavailable' }); }
+  });
+  app.post<{ Body: { cafe_name?: unknown } }>('/v1/auth/cafe-name/check', { bodyLimit: 4096 }, async (request, reply) => {
+    const token = bearer(request);
+    if (!token) return reply.code(401).send({ error: 'session_expired' });
+    try {
+      const player = await store.me(hashSecret(token));
+      if (!player) return reply.code(401).send({ error: 'session_expired' });
+      const candidate = validateCafeName(request.body?.cafe_name);
+      if (!candidate.ok) return reply.code(400).send({ error: 'invalid_cafe_name', reason: candidate.reason });
+      const available = await store.isCafeNameAvailable(candidate.name, player.id);
+      // Availability is advisory, not a reservation. Saving must handle UNIQUE conflicts.
+      return { cafe_name: candidate.name, available };
+    } catch { return reply.code(503).send({ error: 'server_unavailable' }); }
+  });
+  app.post<{ Body: { owner_character_id?: unknown; cafe_name?: unknown } }>('/v1/auth/cafe/setup', { bodyLimit: 4096 }, async (request, reply) => {
+    const token = bearer(request);
+    if (!token) return reply.code(401).send({ error: 'session_expired' });
+    const owner = request.body?.owner_character_id;
+    const candidate = validateCafeName(request.body?.cafe_name);
+    if (typeof owner !== 'string' || !owners.has(owner)) return reply.code(400).send({ error: 'invalid_owner' });
+    if (!candidate.ok) return reply.code(400).send({ error: 'invalid_cafe_name', reason: candidate.reason });
+    try {
+      const result = await store.setupCafe(hashSecret(token), owner, candidate.name);
+      if ('error' in result) return reply.code(result.error === 'session_expired' ? 401 : 409).send(result);
+      return result;
     } catch { return reply.code(503).send({ error: 'server_unavailable' }); }
   });
   app.post<{ Body: { refreshToken?: string; request_id?: string } }>('/v1/auth/session/refresh', { bodyLimit: 4096 }, async (request, reply) => {
